@@ -19,7 +19,8 @@ function app = DC_Power_GUI(controller)
                                    'StartTime', datetime('now'), ...
                                    'TimerHandle', [], ...
                                    'LastStatus', "", ...
-                                   'LogData', []);
+                                   'LogData', [], ...
+                                   'WorkMode', ""); 
 
                         
     % 主布局：4行1列
@@ -199,6 +200,7 @@ function app = DC_Power_GUI(controller)
         addlistener(app.Controller, 'RegisterReceived', @(~, evt) cbRegisterReceived(app, evt));
         addlistener(app.Controller, 'AlarmReceived', @(~, evt) cbAlarmReceived(app, evt));
         addlistener(app.Controller, 'ResultReceived', @(~, evt) cbResultReceived(app, evt));
+        addlistener(app.Controller, 'TimeoutTriggered', @(~, evt) cbTimeoutTriggered(app));
     end
     
 end
@@ -427,6 +429,11 @@ function cbStartPushed(app)
     currentState = app.BtnStart.Text;
     if strcmp(currentState, '启 动')
         config = app.UIFigure.UserData;
+        if isfield(config, 'WorkMode') && strcmp(config.WorkMode, "local_ctrl")
+            uialert(app.UIFigure, "设备当前处于【本地控制】模式，拒绝接收远程升压指令！请在设备物理面板上切换至远程模式。", "权限受限", 'Icon', 'warning');
+            app.BtnStart.Enable = 'on'; % 恢复按钮允许再次点击
+            return; % 直接终止执行，不发指令
+        end
         config.StartTime = datetime('now'); % 重置时间零点为当前点击时间
         config.LogData = struct('Time', double.empty(0,1), 'Vol', double.empty(0,1), 'Cur', double.empty(0,1), 'Timestamps', datetime.empty(0, 1)); 
         app.UIFigure.UserData = config; % 写回
@@ -566,7 +573,41 @@ function cbStatusUpdated(app, evt)
             app.UIFigure.UserData = config; % 变更后写回
         end
     end
+    if isfield(evt.Payload, 'WorkMode')
+        workModeStr = string(evt.Payload.WorkMode);
+        if ~strcmp(config.WorkMode, workModeStr)
+            config.WorkMode = workModeStr;
+            app.UIFigure.UserData = config; % 变更后写回
+            
+            % 动态改变右上角 Label 的文字和颜色
+            if strcmp(workModeStr, "local_ctrl")
+                app.LblMode.Text = '本地控制锁';
+                app.LblMode.FontColor = '#DAA520'; % 警告黄
+                logMsg(app, "⚠️ 设备切换至本地控制模式，上位机被锁定");
+            elseif strcmp(workModeStr, "remote_ctrl")
+                app.LblMode.Text = '远程控制就绪';
+                app.LblMode.FontColor = '#32CD32'; % 绿色
+                logMsg(app, "✅ 设备已允许远程控制");
+            end
+        end
+    end
+    % 动态扫描 Query 回执中的所有字段，若任意键的值为 "Alarm"，立即触发急停
+    payloadFields = fieldnames(evt.Payload);
+    alarmList = [];
+    for i = 1:length(payloadFields)
+        val = evt.Payload.(payloadFields{i});
+        if (ischar(val) || isstring(val)) && strcmp(string(val), "Alarm")
+            alarmList = [alarmList, string(payloadFields{i})];
+        end
+    end
     
+    if ~isempty(alarmList) && strcmp(app.BtnStart.Text, '终 止')
+        warnMsg = "周期查询截获硬件异常: " + join(alarmList, ", ");
+        logMsg(app, "❌ " + warnMsg);
+        % 调用现有的安全停机流程
+        safeStopAndCleanup(app);
+        uialert(app.UIFigure, warnMsg + "，已执行安全停机！", "硬件级告警", 'Icon', 'error');
+    end
     % 软件过压/过流保护
     if vol_kV > config.OV_kV || cur_mA > config.OC_mA
         if strcmp(app.BtnStart.Text, '终 止')
@@ -583,29 +624,84 @@ function cbStatusUpdated(app, evt)
 end
 
 function cbRegisterReceived(app, evt)
-    if isvalid(app.UIFigure)
-        app.LblConnect.Text = '已连接';
-        app.LblConnect.FontColor = '#32CD32'; % 绿色
+    if ~isvalid(app.UIFigure)
+        return;
+    end
+    
+    app.LblConnect.Text = '已连接';
+    app.LblConnect.FontColor = '#32CD32'; % 绿色
+    
+    % ============ 解决问题2：动态解析设备量程 ============
+    if isfield(evt.Payload, 'HardwareVer')
+        hwVer = string(evt.Payload.HardwareVer);
+        % 使用正则表达式提取形如 "HDZGFP28A_60_5" 中的 60 和 5
+        tokens = regexp(hwVer, '_(\d+)_(\d+)', 'tokens');
+        
+        if ~isempty(tokens)
+            maxVol_kV = str2double(tokens{1}{1});
+            maxCur_mA = str2double(tokens{1}{2});
+            
+            logMsg(app, sprintf("📡 设备注册成功，识别到硬件额定量程: %dkV / %dmA", maxVol_kV, maxCur_mA));
+            
+            % 1. 动态更新仪表盘量程 (给量程留 15% 左右的视觉余量)
+            gaugeVolMax = ceil(maxVol_kV * 1.15);
+            app.GaugeVol.Limits = [0, gaugeVolMax];
+            % 达到额定值时进度条变红报警色
+            app.GaugeVol.ScaleColorLimits = [maxVol_kV, gaugeVolMax]; 
+            
+            gaugeCurMax = ceil(maxCur_mA * 1.2);
+            app.GaugeCur.Limits = [0, gaugeCurMax];
+            app.GaugeCur.ScaleColorLimits = [maxCur_mA, gaugeCurMax];
+            
+            % 2. 动态更新波形图 Y 轴量程
+            yyaxis(app.UIAxes, 'left');
+            app.UIAxes.YLim = [0, gaugeVolMax];
+            
+            yyaxis(app.UIAxes, 'right');
+            app.UIAxes.YLim = [0, gaugeCurMax];
+            
+            % 3. 动态更新软件保护参数的默认值 (UserData)
+            config = app.UIFigure.UserData;
+            config.OV_kV = maxVol_kV * 1.05; % 默认过压保护设为额定的 105%
+            config.OC_mA = maxCur_mA * 1.10; % 默认过流保护设为额定的 110%
+            config.MaxC_mA = maxCur_mA;      % 最大允许输出电流设为额定值
+            app.UIFigure.UserData = config;
+            
+        else
+            logMsg(app, "⚠️ 设备注册成功，但无法从 HardwareVer 解析量程参数，使用默认配置。");
+        end
     end
 end
 
 function cbAlarmReceived(app, evt)
     if isvalid(app.UIFigure)
+        if isfield(evt.Payload, 'CommunicationTimeout')
+            % 1. 改变 UI 界面连接状态
+            app.LblConnect.Text = '通信中断';
+            app.LblConnect.FontColor = '#FF6347'; % 红色警示
+            logMsg(app, "❌ 发生致命错误: 通信超时，2秒内未收到设备状态！");
+            
+            % 2. 如果正在运行，强制安全停机
+            if strcmp(app.BtnStart.Text, '终 止')
+                safeStopAndCleanup(app);
+            end
+            
+            % 3. 弹窗警告用户
+            uialert(app.UIFigure, "设备通信超时断开！已自动切断高压并封档数据，请检查通信线缆。", "通信中断", 'Icon', 'error');
+            return; % 直接返回，不走下面的常规硬件告警逻辑
+        end
+
         if strcmp(app.BtnStart.Text, '终 止')
-             saveHistoricalData(app);
+             safeStopAndCleanup(app); % 统一用此函数代替原来零散的清理
         end
         uialert(app.UIFigure, "收到硬件告警！设备可能已急停。数据已自动封档。", "硬件告警", 'Icon', 'warning');
-        % 恢复按钮状态为启动
-        app.BtnStart.Text = '启 动';
-        app.BtnStart.BackgroundColor = '#32CD32'; 
-        app.BtnStart.Enable = 'on';
         
         errFields = fieldnames(evt.Payload);
         for i = 1:length(errFields)
             val = evt.Payload.(errFields{i});
             if ischar(val) || isstring(val)
                 if strcmp(val, 'Alarm')
-                    logMsg(app, "❌ 收到异常: " + string(errFields{i}));
+                    logMsg(app, "❌ 收到硬件异常: " + string(errFields{i}));
                 end
             end
         end
@@ -647,5 +743,22 @@ function safeStopAndCleanup(app)
         app.BtnStart.BackgroundColor = '#32CD32'; % 恢复绿色
         app.BtnStart.Enable = 'on';
         drawnow;
+    end
+end
+function cbTimeoutTriggered(app)
+    if isvalid(app.UIFigure)
+        % 1. 更新 UI 右上角的连接状态标签
+        app.LblConnect.Text = '通信中断';
+        app.LblConnect.FontColor = '#DC143C'; % 变红警告
+        
+        % 2. 打印日志
+        logMsg(app, "❌ 严重错误: 失去与设备的通信连接(超过2秒无响应)！");
+        
+        % 3. 执行安全停机流程
+        % （由于底层已被 disconnect() 切断，此时调用停机只会清理上位机的定时器、保存历史数据并恢复启动按钮）
+        safeStopAndCleanup(app);
+        
+        % 4. 强行弹窗警告操作员
+        uialert(app.UIFigure, "设备通信中断！由于无法继续获取实时电压，上位机已强制进入安全锁定状态并保存当前数据。请检查通信线缆并重新连接设备！", "物理通信丢失", 'Icon', 'error');
     end
 end

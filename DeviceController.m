@@ -7,18 +7,18 @@ classdef DeviceController < handle
         AlarmReceived    % 收到硬件发来的报警信号 (Payload 为 struct)
         RegisterReceived % 设备初次上线连接确认 (Payload 为 struct)
         ResultReceived   % 指令操作的回执 (Payload 为 struct)
+        TimeoutTriggered % 通信超时丢失事件
     end
     
     properties
         Transport % 依赖注入的传输对象(可以是 SerialTransport 或者 MockTransport)
         TimerObj  % 周期查询状态的定时器 (用于每隔一段时间触发 Query 指令)
-        LastResponseTime % 最后一次收到响应的时间
+        LastResponseTime % 【新增】记录最后一次收到合法报文的时间
     end
     
     methods
         function obj = DeviceController(transportObj)
             obj.Transport = transportObj;
-            obj.LastResponseTime = datetime('now');
             
             % 将底层传来的 String 进行监听，交给当前控制器的 onDataReceived 处理
             addlistener(obj.Transport, 'DataReceived', @obj.onDataReceived);
@@ -72,11 +72,15 @@ classdef DeviceController < handle
         function queryStatus(obj)
             % 周期性向硬件查询目前真实状态
             if obj.Transport.IsConnected
-                if seconds(datetime('now') - obj.LastResponseTime) > 2.0
-                    disp("[安全机制] 通信超时，断开连接...");
-                    notify(obj, 'AlarmReceived', DynamicEvent(struct('CommunicationTimeout', 'Alarm', 'Message', '2秒内未收到设备响应，判定通信中断')));
-                    obj.disconnect();
-                    return;
+                if ~isempty(obj.LastResponseTime)
+                    % 计算从最后一次收到数据到现在的间隔秒数
+                    dt = seconds(datetime('now') - obj.LastResponseTime);
+                    if dt > 2.0 % 超过2秒未收到回执
+                        disp(">>> [内核控制台] 发现通信超时(超2秒无响应)！触发安全断开。");
+                        obj.disconnect(); % 停止查询定时器并强制关闭底层串口
+                        notify(obj, 'TimeoutTriggered'); % 通知上位机 GUI
+                        return; % 终止本次 Query 发送
+                    end
                 end
                 
                 req.CmdCode = "Boost";
@@ -111,7 +115,7 @@ classdef DeviceController < handle
         
         % ============ 接受与解析下位机反馈 ============
         function onDataReceived(obj, ~, eventData)
-            obj.LastResponseTime = datetime('now');
+            obj.LastResponseTime = datetime('now'); 
             rawStr = eventData.Data;
             try
                 % JSON 解析为 struct 字典
@@ -125,7 +129,6 @@ classdef DeviceController < handle
                     obj.replyRegister();
                     
                     % 并且注册成功之后开启周期查询数据的定时器
-                    obj.LastResponseTime = datetime('now');
                     start(obj.TimerObj);
                     
                 elseif isfield(data, 'CmdCode')

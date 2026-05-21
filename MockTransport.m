@@ -10,6 +10,9 @@ classdef MockTransport < ITransport
         BoostSpeed = 1000
         IsBoosting = false
     end
+    properties(SetAccess=public)
+        DropPackets logical = false 
+    end
     
     methods
         function obj = MockTransport()
@@ -26,7 +29,7 @@ classdef MockTransport < ITransport
             start(obj.TimerObj);
             
             % 模拟设备连上电脑后，主动发送REGISTER信息注册
-            regMsg = '{"DeviceType":30006,"DeviceNo":"HDZGFP28A0001","CdCode":"REGISTER","Body":{"Action":0,"HardwareVer":"HDZGFP28A_60_5","SoftwareVer":"V1.0.9"}}';
+            regMsg = '{"DeviceType":30006,"DeviceNo":"HDZGFP28A0001","CdCode":"REGISTER","Body":{"Action":0,"HardwareVer":"HDZGFP28A_100_5","SoftwareVer":"V1.0.9"}}';
             % 延迟一秒钟后虚拟设备自发注册 (防止上位机监听没挂好)
             start(timer('ExecutionMode', 'singleShot', 'StartDelay', 1, 'TimerFcn', @(~,~) obj.mockReceive(regMsg)));
         end
@@ -41,6 +44,10 @@ classdef MockTransport < ITransport
         end
         
         function sendString(obj, strData)
+            if obj.DropPackets
+                disp("🔌 [模拟器]: 物理线缆已断开，报文丢弃...");
+                return;
+            end
             disp("-> [PC发出]: " + strData);
             
             % 解析UI下发的JSON并生成模拟硬件的回复
@@ -84,8 +91,8 @@ classdef MockTransport < ITransport
                            resp.Body.Voltage_V = sprintf("%.1f", obj.CurrentVoltage); % 转为带1位小数的字符串
                            resp.Body.Current_mA = sprintf("%.2f", obj.TargetCurrent); % 转为带2位小数的字符串
                            resp.Body.BoostSpeed_Vs = 1000;
-                           resp.Body.WorkMode = "local_ctrl";
-                           
+                           resp.Body.WorkMode = "remote_ctrl";
+                    
                            % 3. 一键转换为标准 JSON 字符串
                            reply = jsonencode(resp);
                            obj.mockReceive(reply);
