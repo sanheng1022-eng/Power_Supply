@@ -105,7 +105,7 @@ classdef MockTransport < ITransport
                     end
                 end
             catch ME
-                warning("虚拟设备不识别该包(JSON解析失败): %s", ME.message);
+                warning('MockTransport:JsonParseFailed', '虚拟设备不识别该包(JSON解析失败): %s', ME.message);
             end
         end
     end
